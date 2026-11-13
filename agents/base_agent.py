@@ -26,26 +26,48 @@ class BaseAgent(ABC):
         """Hook called after each episode."""
 
     def save(self, path: str) -> None:
-        """Persist agent state to disk. No-op by default."""
+        """Persist agent state to disk. Default writes a marker file so callers
+        can distinguish a stateless agent (heuristics) from a silent failure."""
+        from pathlib import Path
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"stateless-agent:{type(self).__name__}\n")
 
     def load(self, path: str) -> None:
-        """Restore agent state from disk. No-op by default."""
+        """Restore agent state from disk. No-op for stateless agents."""
 
 
 def compute_action_mask(env: CloudClusterEnv) -> np.ndarray:
-    """Return bool array of length N_SERVERS — True if the head-of-queue job
-    can be assigned to that server given current capacity."""
-    mask = np.zeros(env.num_servers, dtype=bool)
-    if len(env.job_queue) == 0:
-        # No job to place — every action is a no-op; mark all valid so
-        # the agent doesn't see a degenerate all-zero mask.
-        mask[:] = True
-        return mask
-    job = env.job_queue[0]
-    for i, server in enumerate(env.servers):
-        mask[i] = server.can_fit(job)
-    if not mask.any():
-        # No server can fit the job — return all-True so policy still picks
-        # something; the env will apply the invalid-action penalty.
-        mask[:] = True
+    """Return bool mask of shape (K*N + 1 + N,) for the joint action space.
+
+    Layout:
+      mask[k*N + n]        : assign queue[k] to server[n] — server must be
+                             awake-and-available AND able to fit the job.
+      mask[K*N]            : "wait" — gated to "no dispatch is legal" so the
+                             agent doesn't fall into a wait-everything local
+                             optimum (queue-pressure penalty is heavily γ-
+                             discounted, so without this gate waiting looks
+                             free).
+      mask[K*N + 1 + n]    : toggle sleep on server n. Legal whenever the
+                             server is in a state that admits a transition —
+                             awake-and-idle (→ sleep) or asleep (→ wake).
+                             Sleep/wake are NOT gated on "no dispatch
+                             possible"; agent may sleep underused servers
+                             even with assignable jobs in the queue.
+    """
+    N = env.num_servers
+    K = env.job_queue_size
+    mask = np.zeros(N * K + 1 + N, dtype=bool)
+    for k in range(min(K, len(env.job_queue))):
+        job = env.job_queue[k]
+        for n, server in enumerate(env.servers):
+            if server.can_fit(job):
+                mask[k * N + n] = True
+    # Wait is only legal when no dispatch is.
+    if not mask[: N * K].any():
+        mask[N * K] = True
+    # Sleep / wake toggles.
+    for n, server in enumerate(env.servers):
+        if server.can_request_sleep or server.can_request_wake:
+            mask[N * K + 1 + n] = True
     return mask

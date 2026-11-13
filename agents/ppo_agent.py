@@ -144,7 +144,15 @@ class PPOAgent(BaseAgent):
         a = torch.from_numpy(actions).long().to(self.device)
         old_lp = torch.from_numpy(old_log_probs).to(self.device)
         adv = torch.from_numpy(advantages).to(self.device)
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        # Guard against the degenerate case where every advantage is identical
+        # (e.g. saturated episode where every step has the same reward) — then
+        # std≈0 and dividing by 1e-8 would explode the gradient. Skip the
+        # whitening; the policy gets no signal from this batch anyway.
+        adv_std = adv.std()
+        if adv_std > 1e-6:
+            adv = (adv - adv.mean()) / (adv_std + 1e-8)
+        else:
+            adv = adv - adv.mean()
         ret = torch.from_numpy(returns).to(self.device)
         m = torch.from_numpy(masks).to(self.device)
 
@@ -191,16 +199,55 @@ class PPOAgent(BaseAgent):
         env: CloudClusterEnv,
         total_steps: int,
         on_episode_end: Callable | None = None,
+        train_seeds: list[int] | None = None,
+        run_name: str | None = None,
+        log_dir: str = "logs",
     ) -> list[dict]:
         """PPO outer loop. Collects rollouts of `rollout_steps` and updates.
 
+        If `train_seeds` is given, every new episode samples uniformly from
+        that pool — same train/test seed protocol as DQN. Otherwise the env
+        uses whatever seed it was built with (legacy single-trajectory mode).
+
         Returns a list of per-episode summary dicts.
         """
+        from pathlib import Path
         from training.trainer import EpisodeStats  # avoid circular import
 
         ep_stats: list[dict] = []
+        seed_rng = np.random.default_rng(0)
+
+        log_fh = None
+        if run_name is not None:
+            Path(log_dir).mkdir(parents=True, exist_ok=True)
+            log_fh = open(Path(log_dir) / f"{run_name}.log", "a", buffering=1)
+
+        def _log(msg: str) -> None:
+            print(msg)
+            if log_fh is not None:
+                log_fh.write(msg + "\n")
+
+        def _reset_env():
+            if train_seeds:
+                ws = int(seed_rng.choice(train_seeds))
+                return env.reset(options={"workload_seed": ws})
+            return env.reset()
+
+        try:
+            return self._train_loop_impl(
+                env, total_steps, on_episode_end, train_seeds, _log, _reset_env, ep_stats,
+            )
+        finally:
+            if log_fh is not None and not log_fh.closed:
+                log_fh.close()
+
+    def _train_loop_impl(
+        self, env, total_steps, on_episode_end, train_seeds, _log, _reset_env, ep_stats,
+    ) -> list[dict]:
+        from training.trainer import EpisodeStats  # avoid circular import
+
         steps_done = 0
-        obs, _ = env.reset()
+        obs, _ = _reset_env()
         mask = compute_action_mask(env)
         ep_reward = 0.0
         ep_power = 0.0
@@ -245,7 +292,7 @@ class PPOAgent(BaseAgent):
                     if on_episode_end is not None:
                         on_episode_end(stats)
                     ep_idx += 1
-                    obs, _ = env.reset()
+                    obs, _ = _reset_env()
                     mask = compute_action_mask(env)
                     ep_reward = 0.0
                     ep_power = 0.0
@@ -271,7 +318,7 @@ class PPOAgent(BaseAgent):
                 returns=ret,
                 masks=np.stack(roll.masks),
             )
-            print(
+            _log(
                 f"[ppo] steps={steps_done:7d} "
                 f"pol={losses['policy']:.4f} val={losses['value']:.4f} "
                 f"ent={losses['entropy']:.4f} eps_collected={ep_idx}"

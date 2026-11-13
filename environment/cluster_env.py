@@ -7,6 +7,7 @@ import numpy as np
 from gymnasium import spaces
 
 from environment import config
+from environment.fleet import build_fleet
 from environment.job import Job
 from environment.power_model import compute_power
 from environment.server import Server
@@ -36,6 +37,9 @@ class CloudClusterEnv(gym.Env):
         job_queue_size: int = config.JOB_QUEUE_SIZE,
         episode_length: int = config.EPISODE_LENGTH,
         invalid_action_penalty: float = config.INVALID_ACTION_PENALTY,
+        toggle_penalty: float = config.TOGGLE_PENALTY,
+        cluster_type: str = "homogeneous",
+        cluster_seed: int = 0,
         render_mode: str | None = None,
     ):
         super().__init__()
@@ -50,17 +54,33 @@ class CloudClusterEnv(gym.Env):
         self.job_queue_size = job_queue_size
         self.episode_length = episode_length
         self.invalid_action_penalty = invalid_action_penalty
+        self.toggle_penalty = toggle_penalty
+        self.cluster_type = cluster_type
+        self.cluster_seed = cluster_seed
         self.render_mode = render_mode
 
-        # Observation: [server_cpu_1, server_mem_1, ..., server_cpu_N, server_mem_N,
-        #               job1_cpu, job1_mem, job1_dur, job1_wait, ..., jobK_cpu, ...]
-        obs_dim = 2 * num_servers + 4 * job_queue_size
+        # Observation per server: [cpu_util, mem_util, p_max_norm, cpu_cap_norm,
+        # is_asleep, wakeup_norm]
+        # — first four expose tier identity; last two expose lifecycle state
+        # so the agent can decide to wake/sleep servers.
+        obs_dim = 6 * num_servers + 4 * job_queue_size
         self.observation_space = spaces.Box(
             low=0.0, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
 
-        # Action: assign head-of-queue job to server k
-        self.action_space = spaces.Discrete(num_servers)
+        # Action: Discrete(K * N + 1 + N).
+        #   a in [0, K*N)             : assign queue[k = a // N] to server[n = a % N]
+        #   a == K * N                : "wait" — no dispatch this step
+        #   a in [K*N+1, K*N+1+N)     : toggle sleep/wake on server (a - K*N - 1)
+        #     • awake & idle  → request_sleep
+        #     • asleep        → request_wake (begins WAKEUP_DELAY warm-up)
+        # The wait action is gated to "no dispatch is legal"; sleep/wake are
+        # always legal whenever physically valid (idle awake / asleep), so the
+        # agent can sleep underused servers even when other dispatches are open.
+        self.n_actions = num_servers * job_queue_size + 1 + num_servers
+        self.wait_action = num_servers * job_queue_size
+        self.sleep_action_base = num_servers * job_queue_size + 1
+        self.action_space = spaces.Discrete(self.n_actions)
 
         # Internal state
         self.servers: list[Server] = []
@@ -73,16 +93,24 @@ class CloudClusterEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        self.servers = [
-            Server(server_id=i) for i in range(self.num_servers)
-        ]
+        self.servers = build_fleet(
+            num_servers=self.num_servers,
+            cluster_type=self.cluster_type,
+            seed=self.cluster_seed,
+        )
         self.job_queue = deque()
         self.current_step = 0
         self.total_power = 0.0
         self.total_sla_violations = 0
         self.total_jobs_completed = 0
 
-        self.workload.reset()
+        # `options={"workload_seed": int}` lets the trainer pick which seed
+        # this episode samples from a pool. None → workload uses its own seed.
+        workload_seed = (options or {}).get("workload_seed")
+        try:
+            self.workload.reset(seed=workload_seed)
+        except TypeError:
+            self.workload.reset()
 
         # Fill initial queue
         initial_jobs = self.workload.get_next_jobs(0)
@@ -98,15 +126,44 @@ class CloudClusterEnv(gym.Env):
         reward = 0.0
         sla_violations_this_step = 0
 
-        # --- Assign head-of-queue job to chosen server ---
-        if len(self.job_queue) > 0:
-            job = self.job_queue[0]
-            server = self.servers[action]
-
-            if server.can_fit(job):
-                self.job_queue.popleft()
-                server.assign(job)
+        # --- Decode action and dispatch ---
+        if action == self.wait_action:
+            pass  # no-op
+        elif action >= self.sleep_action_base:
+            # Toggle sleep on server (action - sleep_action_base).
+            n = action - self.sleep_action_base
+            server = self.servers[n]
+            if server.can_request_sleep:
+                server.request_sleep()
+                reward -= self.toggle_penalty
+            elif server.can_request_wake:
+                server.request_wake()
+                # Wake is free: we want the agent to recover capacity
+                # immediately when load arrives. Asymmetric cost (sleep paid,
+                # wake free) still prevents flicker because back-to-back
+                # sleep→wake→sleep pays the sleep penalty twice.
             else:
+                # Toggle requested but server has running jobs and is awake,
+                # or is mid-wake. Treat as invalid action.
+                reward += self.invalid_action_penalty
+        else:
+            k = action // self.num_servers
+            n = action % self.num_servers
+            if k < len(self.job_queue):
+                job = self.job_queue[k]
+                server = self.servers[n]
+                if server.can_fit(job):
+                    # Remove from queue at position k (deque doesn't have pop(i)).
+                    new_queue = deque()
+                    for i, j in enumerate(self.job_queue):
+                        if i != k:
+                            new_queue.append(j)
+                    self.job_queue = new_queue
+                    server.assign(job)
+                else:
+                    reward += self.invalid_action_penalty
+            else:
+                # Tried to dispatch a queue position that doesn't exist.
                 reward += self.invalid_action_penalty
 
         # --- Advance simulation by one timestep ---
@@ -136,27 +193,74 @@ class CloudClusterEnv(gym.Env):
 
         self.total_sla_violations += sla_violations_this_step
 
+        # --- Fix 2: continuous SLA pressure ---
+        # The discrete violations counted above only fire at expiry boundaries.
+        # That's terrible credit assignment — actions taken N steps before the
+        # expiry got no signal. Add a continuous per-step pressure term that
+        # grows with the *severity* of overdue queued jobs (sum of normalized
+        # overdue ratios). This gives the agent gradients during the entire
+        # buildup phase, when its actions actually matter.
+        queue_pressure = 0.0
+        for job in self.job_queue:
+            wait = self.current_step - job.arrival_time
+            if wait > 0 and job.sla_deadline > 0:
+                # Headroom remaining (1.0 = just arrived, 0.0 = at deadline,
+                # negative = overdue). Pressure is max(0, -headroom_norm).
+                headroom_norm = (job.sla_deadline - wait) / job.sla_deadline
+                if headroom_norm < 0:
+                    queue_pressure += -headroom_norm  # how-overdue, ratio
+
         # --- Pull new arrivals ---
         new_jobs = self.workload.get_next_jobs(self.current_step)
         self.job_queue.extend(new_jobs)
 
         # --- Compute reward ---
-        cluster_power = sum(
-            compute_power(s.cpu_utilization, self.p_idle, self.p_max, self.power_alpha)
-            for s in self.servers
-        )
+        # Server.power_draw() handles the three lifecycle states (asleep ⇒
+        # standby fraction of p_idle, waking ⇒ full p_idle, awake ⇒ full curve).
+        cluster_power = sum(s.power_draw() for s in self.servers)
         self.total_power += cluster_power
 
-        # Normalize power to [0, 1] range for reward computation
-        max_possible_power = self.p_max * self.num_servers
-        normalized_power = cluster_power / max_possible_power
+        # Active power = power above each server's *own* idle floor for awake
+        # servers. Sleeping servers contribute 0 to active power AND drop the
+        # cluster_power floor, so the agent now has a real lever: putting a
+        # server to sleep saves ~0.95 · p_idle every step it stays asleep.
+        active_ceiling = sum(s.p_max - s.p_idle for s in self.servers)
+        active_power = sum(
+            max(0.0, s.power_draw() - s.p_idle)
+            for s in self.servers
+            if not s.is_asleep
+        )
+        normalized_active = active_power / active_ceiling if active_ceiling > 0 else 0.0
 
-        # SLA term divided by N_SERVERS so its magnitude is comparable to
-        # normalized_power (which lies in [0,1]). Without this scaling, the
-        # SLA term dominates DQN's Bellman targets and PPO's value loss.
+        # Idle-floor pressure: only penalize servers that are awake AND
+        # underutilized (i.e. could plausibly be put to sleep). Weighting by
+        # (1 − utilization) means a fully-loaded server contributes 0 to this
+        # term, while a zero-load awake server pays its full p_idle. Without
+        # this, the agent gets the same penalty for a busy server as for an
+        # idle one and learns to over-sleep — driving SLA violations up while
+        # only marginally reducing power.
+        sleepable_idle = sum(
+            s.p_idle * (1.0 - max(0.0, min(1.0, s.cpu_utilization)))
+            for s in self.servers
+            if not s.is_asleep
+        )
+        full_idle_total = sum(s.p_idle for s in self.servers) or 1.0
+        normalized_idle = sleepable_idle / full_idle_total  # ∈ [0, 1]
+
+        # SLA term: discrete violations divided by N_SERVERS (boundary signal)
+        # plus continuous queue_pressure (within-deadline gradient).
+        sla_signal = (
+            sla_violations_this_step / max(1, self.num_servers)
+            + queue_pressure / max(1, self.num_servers)
+        )
+        # Power term combines active draw (variable) and sleepable-idle
+        # footprint (the lever sleep gives us). Weighted 80/20 so the active
+        # signal stays louder than the sleep bonus — otherwise the agent
+        # over-sleeps even productive servers.
+        power_term = 0.8 * normalized_active + 0.2 * normalized_idle
         reward += -(
-            self.reward_alpha * normalized_power
-            + self.reward_beta * sla_violations_this_step / max(1, self.num_servers)
+            self.reward_alpha * power_term
+            + self.reward_beta * sla_signal
         )
 
         # --- Check termination ---
@@ -166,15 +270,34 @@ class CloudClusterEnv(gym.Env):
         obs = self._get_obs()
         info = self._get_info()
         info["step_power"] = cluster_power
+        info["step_active_power"] = active_power
         info["step_sla_violations"] = sla_violations_this_step
+        info["n_asleep"] = sum(1 for s in self.servers if s.is_asleep)
+        info["n_waking"] = sum(
+            1 for s in self.servers
+            if (not s.is_asleep) and s.wakeup_remaining > 0
+        )
 
         return obs, reward, terminated, truncated, info
 
     def _get_obs(self) -> np.ndarray:
-        # Server features: [cpu_util, mem_util] per server
+        # Server features: [cpu_util, mem_util, p_max_norm, cpu_cap_norm,
+        #                   is_asleep, wakeup_norm].
+        # _norm values are relative to the env defaults so the canonical
+        # "standard tier" = 1.0. wakeup_norm = wakeup_remaining / WAKEUP_DELAY
+        # so the agent sees how soon a waking server becomes available.
         server_features = []
+        wakeup_denom = max(1, config.SERVER_WAKEUP_DELAY)
         for s in self.servers:
-            server_features.extend([s.cpu_utilization, s.mem_utilization])
+            p_max_norm = s.p_max / config.P_MAX if config.P_MAX > 0 else 1.0
+            cap_norm = s.cpu_capacity / config.SERVER_CPU_CAPACITY if config.SERVER_CPU_CAPACITY > 0 else 1.0
+            is_asleep_f = 1.0 if s.is_asleep else 0.0
+            wakeup_norm = s.wakeup_remaining / wakeup_denom
+            server_features.extend([
+                s.cpu_utilization, s.mem_utilization,
+                p_max_norm, cap_norm,
+                is_asleep_f, wakeup_norm,
+            ])
 
         # Job queue features: [cpu_req, mem_req, duration, wait_time] per visible job
         queue_features = []

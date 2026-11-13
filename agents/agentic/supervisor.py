@@ -122,14 +122,48 @@ class SupervisorAgent(BaseAgent):
         episodes: int,
         on_episode_end: Callable | None = None,
         log_every: int = 10,
+        run_name: str | None = None,
+        log_dir: str = "logs",
+        train_seeds: list[int] | None = None,
     ) -> list[dict]:
         from training.trainer import EpisodeStats  # local import avoids cycle
 
-        max_cluster_power = config.P_MAX * env.num_servers
+        max_cluster_power = sum(s.p_max for s in env.servers) or (config.P_MAX * env.num_servers)
         ep_stats: list[dict] = []
 
+        log_fh = None
+        if run_name is not None:
+            Path(log_dir).mkdir(parents=True, exist_ok=True)
+            log_fh = open(Path(log_dir) / f"{run_name}.log", "a", buffering=1)
+
+        def _log(msg: str) -> None:
+            print(msg)
+            if log_fh is not None:
+                log_fh.write(msg + "\n")
+
+        seed_rng = np.random.default_rng(0)
+
+        try:
+            return self._run_episodes(
+                env, episodes, on_episode_end, log_every,
+                max_cluster_power, ep_stats, _log, train_seeds, seed_rng,
+            )
+        finally:
+            if log_fh is not None and not log_fh.closed:
+                log_fh.close()
+
+    def _run_episodes(
+        self, env, episodes, on_episode_end, log_every,
+        max_cluster_power, ep_stats, _log, train_seeds, seed_rng,
+    ) -> list[dict]:
+        from training.trainer import EpisodeStats  # local import avoids cycle
+
         for ep in range(episodes):
-            obs, _info = env.reset()
+            if train_seeds:
+                workload_seed = int(seed_rng.choice(train_seeds))
+                obs, _info = env.reset(options={"workload_seed": workload_seed})
+            else:
+                obs, _info = env.reset()
             mask = compute_action_mask(env)
             sla_budget_remaining = float(self.sla_budget_per_episode)
             last_power_norm = 0.0
@@ -225,7 +259,14 @@ class SupervisorAgent(BaseAgent):
                 G = r + config.GAMMA * G
                 returns.insert(0, G)
             ret_t = torch.tensor(returns, dtype=torch.float32, device=self.device)
-            ret_t = (ret_t - ret_t.mean()) / (ret_t.std() + 1e-8)
+            # Saturated episodes can produce constant returns → std≈0 → gradient
+            # explosion via the 1e-8 epsilon. Skip whitening when the signal is
+            # too flat to learn from anyway.
+            ret_std = ret_t.std()
+            if ret_std > 1e-6:
+                ret_t = (ret_t - ret_t.mean()) / (ret_std + 1e-8)
+            else:
+                ret_t = ret_t - ret_t.mean()
             log_probs_t = torch.cat(log_probs)
             entropy_t = torch.cat(entropies).mean()
             policy_loss = -(log_probs_t * ret_t).mean() - self.entropy_coef * entropy_t
@@ -248,7 +289,7 @@ class SupervisorAgent(BaseAgent):
             ep_stats.append(stats.__dict__)
 
             if (ep + 1) % log_every == 0 or ep == 0:
-                print(
+                _log(
                     f"[supervisor] ep {ep+1:5d}/{episodes} "
                     f"R={ep_reward:9.2f} power={ep_power:8.0f} sla={ep_sla:4d} "
                     f"sup_loss={float(policy_loss.item()):.4f} "

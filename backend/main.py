@@ -9,7 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.core.config import settings
 from backend.core.websocket_manager import bus
 from backend.models import db
-from backend.routers import experiments, metrics, simulator, training
+from backend.routers import config as config_router
+from backend.routers import experiments, metrics, offline, simulator, sweep, training
 
 
 @asynccontextmanager
@@ -44,3 +45,6 @@ app.include_router(training.router)
 app.include_router(experiments.router)
 app.include_router(simulator.router)
 app.include_router(metrics.router)
+app.include_router(config_router.router)
+app.include_router(offline.router)
+app.include_router(sweep.router)
